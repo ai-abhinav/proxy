@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 /**
- * serverless.js — single-file OpenCode proxy (zero npm deps)
+ * serverless.js — universal OpenCode Zen proxy (zero npm deps)
  *
- * Per request: fetch exit IP → stream OpenCode SSE tokens in real time
+ * Passes through the model from each API request — no hardcoded model.
+ * Per request: fetch exit IP → stream to OpenCode with client's model + stream:true
  *
  * Local:  node serverless.js
- * Lambda: exports handler (buffered) or streamifyResponse on Node 20+
- * Env:    PORT, MODEL, PROXY_URL, PROXY_USER, PROXY_PASS, UPSTREAM, IPINFO
+ * Lambda: exports handler
+ * Env:    PORT, DEFAULT_MODEL (optional fallback), PROXY_*, UPSTREAM, IPINFO
  */
 
 "use strict";
@@ -18,8 +19,9 @@ const tls = require("tls");
 const { URL } = require("url");
 
 const UPSTREAM = process.env.UPSTREAM || "https://opencode.ai/zen/v1/chat/completions";
+const MODELS_UPSTREAM = process.env.MODELS_UPSTREAM || "https://opencode.ai/zen/v1/models";
 const IPINFO = process.env.IPINFO || "http://ipinfo.io/ip";
-const MODEL = process.env.MODEL || "deepseek-v4-flash-free";
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "";
 const PORT = parseInt(process.env.PORT || "8888", 10);
 const PROXY_HOST = process.env.PROXY_URL || "http://global.rotgb.711proxy.com:10000";
 const PROXY_USER = process.env.PROXY_USER || "USER500841-zone-custom";
@@ -261,23 +263,46 @@ async function fetchExitIp(sessionUser) {
   return res.body.replace(/\s/g, "");
 }
 
-function patchBody(raw) {
+function prepareBody(raw) {
   let body;
   try {
     body = typeof raw === "string" ? JSON.parse(raw) : raw;
   } catch {
-    body = { messages: [{ role: "user", content: String(raw || "") }] };
+    throw new Error("invalid json body");
   }
-  body.model = MODEL;
+  if (!body.model || typeof body.model !== "string" || !body.model.trim()) {
+    if (DEFAULT_MODEL) body.model = DEFAULT_MODEL;
+    else throw new Error("model is required in request body");
+  }
   body.stream = true;
   return JSON.stringify(body);
+}
+
+async function proxyHttpsBuffer(sessionUser, urlStr, { method = "GET", headers = {}, body = null } = {}) {
+  const chunks = [];
+  const { status } = await proxyHttpsStream(sessionUser, urlStr, {
+    method,
+    headers,
+    body,
+    onChunk: (chunk) => chunks.push(chunk),
+  });
+  return { status, body: Buffer.concat(chunks).toString("utf8") };
+}
+
+async function fetchModels() {
+  const session = proxySessionUser();
+  return proxyHttpsBuffer(session, MODELS_UPSTREAM, {
+    method: "GET",
+    headers: { Accept: "application/json" },
+  });
 }
 
 async function streamChat(rawBody, write, end) {
   const session = proxySessionUser();
   const proxyIp = await fetchExitIp(session);
 
-  write(`event: proxy_ip\ndata: ${JSON.stringify({ proxy_ip: proxyIp })}\n\n`);
+  // Include choices:[] so OpenAI-compatible parsers (Zod union) accept this metadata chunk.
+  write(`event: proxy_ip\ndata: ${JSON.stringify({ proxy_ip: proxyIp, choices: [] })}\n\n`);
 
   const { status } = await proxyHttpsStream(session, UPSTREAM, {
     method: "POST",
@@ -285,7 +310,7 @@ async function streamChat(rawBody, write, end) {
       "Content-Type": "application/json",
       Accept: "text/event-stream",
     },
-    body: patchBody(rawBody),
+    body: prepareBody(rawBody),
     onChunk: (chunk) => write(chunk.toString("utf8")),
   });
 
@@ -338,14 +363,28 @@ async function handleHttp(req, res) {
   }
 
   if (req.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
-    res.writeHead(200, jsonHeaders());
-    res.end(JSON.stringify({ object: "list", data: [{ id: MODEL, object: "model", owned_by: "opencode" }] }));
+    try {
+      const { status, body } = await fetchModels();
+      res.writeHead(status >= 200 && status < 300 ? 200 : status, jsonHeaders());
+      res.end(body || JSON.stringify({ object: "list", data: [] }));
+    } catch (e) {
+      res.writeHead(502, jsonHeaders());
+      res.end(JSON.stringify({ error: { message: String(e.message || e) } }));
+    }
     return;
   }
 
   if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/v1")) {
     res.writeHead(200, jsonHeaders());
-    res.end(JSON.stringify({ ok: true, model: MODEL, mode: "serverless", stream: true }));
+    res.end(JSON.stringify({
+      ok: true,
+      mode: "universal-opencode-proxy",
+      upstream: UPSTREAM,
+      models: "/v1/models",
+      chat: "/v1/chat/completions",
+      note: "model comes from your request body",
+      stream: true,
+    }));
     return;
   }
 
@@ -362,6 +401,14 @@ async function handleHttp(req, res) {
   try { raw = await readBody(req); } catch {
     res.writeHead(400, jsonHeaders());
     res.end(JSON.stringify({ error: { message: "bad body" } }));
+    return;
+  }
+
+  try {
+    prepareBody(raw);
+  } catch (e) {
+    res.writeHead(400, jsonHeaders());
+    res.end(JSON.stringify({ error: { message: String(e.message || e), type: "invalid_request_error" } }));
     return;
   }
 
@@ -410,11 +457,11 @@ const handler =
       })
     : lambdaHandler;
 
-module.exports = { handler, streamChat, fetchExitIp, patchBody, handleHttp };
+module.exports = { handler, streamChat, fetchExitIp, prepareBody, handleHttp, fetchModels };
 
 if (require.main === module) {
   http.createServer(handleHttp).listen(PORT, "0.0.0.0", () => {
-    console.error(`[serverless] http://0.0.0.0:${PORT} | model=${MODEL}`);
-    console.error(`[serverless] fetch IP → stream tokens | zero deps`);
+    console.error(`[serverless] http://0.0.0.0:${PORT} | universal OpenCode proxy`);
+    console.error(`[serverless] model from request | stream SSE | zero deps`);
   });
 }
